@@ -3,7 +3,7 @@
 
 <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>WIDE_MCR_TOOLS_CMG-5</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
     <style>
@@ -2304,6 +2304,9 @@
                 this.muteCheckInterval = null;
                 this.TARGET_QUALITY = "hd720";
 
+                // iOS detection and interaction tracking
+                this._hasUserInteracted = !this._isIOS();
+
                 // Faster update interval for more accurate viewer counts
                 this.MIN_INTERVAL_MS = 3000; // 3 seconds for faster updates
                 this.FETCH_TIMEOUT = 8000;
@@ -2384,6 +2387,28 @@
                 this.initYTApiCheck();
                 this._startBadgeProtection();
                 this._startPeriodicCleanup();
+
+                // iOS-specific initialization
+                if (this._isIOS()) {
+                    this._setupIOSInteraction();
+                }
+            }
+
+            _isIOS() {
+                return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+                    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+            }
+
+            _setupIOSInteraction() {
+                ['click', 'touchstart', 'touchend'].forEach(evt => {
+                    document.addEventListener(evt, () => {
+                        this._hasUserInteracted = true;
+                    }, {
+                        once: true,
+                        passive: true,
+                        capture: true
+                    });
+                });
             }
 
             _startPeriodicCleanup() {
@@ -2464,7 +2489,8 @@
             _protectAllBadges() {
                 Object.keys(this.slotStates).forEach((slot) => {
                     const st = this.slotStates[slot];
-                    if (st && st.vidId && st.realtimeActive) {
+                    // Only protect if slot is active and not closed
+                    if (st && st.vidId && st.realtimeActive && !this.closedSlots[slot]) {
                         const bc = document.getElementById(`badge-content-${slot}`);
                         if (bc) {
                             const spanEl = bc.querySelector("span");
@@ -3100,6 +3126,7 @@
                             cc_load_policy: 0,
                             origin: window.location.origin,
                             vq: "hd720",
+                            widget_referrer: window.location.href,
                         },
                         events: {
                             onReady: (e) => this.onPlayerReady(e, slot),
@@ -3118,15 +3145,48 @@
             }
 
             onPlayerReady(e, slot) {
-                e.target.playVideo();
-                this.setQuality720p(e.target);
+                const player = e.target;
+
+                // iOS-specific handling
+                if (this._isIOS()) {
+                    // Ensure muted before playing on iOS
+                    player.mute();
+
+                    // Small delay before playing on iOS
+                    setTimeout(() => {
+                        try {
+                            player.playVideo();
+                            this.setQuality720p(player);
+                        } catch (err) {
+                            console.log('iOS autoplay failed, may need user interaction');
+                        }
+                    }, 100);
+                } else {
+                    player.playVideo();
+                    this.setQuality720p(player);
+                }
+
                 const pd = document.getElementById(`player-${slot}`);
                 if (pd) pd.style.opacity = "1";
             }
 
             onPlayerStateChange(e, slot) {
+                const player = e.target;
+
                 if (e.data === YT.PlayerState.PLAYING) {
-                    this.setQuality720p(e.target);
+                    this.setQuality720p(player);
+                }
+
+                // iOS fix: handle buffering/paused states
+                if (this._isIOS() && e.data === YT.PlayerState.PAUSED) {
+                    // Try to resume if it was supposed to be playing
+                    setTimeout(() => {
+                        try {
+                            if (player.getPlayerState && player.getPlayerState() === YT.PlayerState.PAUSED) {
+                                player.playVideo();
+                            }
+                        } catch (err) {}
+                    }, 500);
                 }
 
                 if (e.data === YT.PlayerState.ENDED) {
@@ -3318,8 +3378,55 @@
                 this.fetchChannelName(url, slot);
             }
 
-            loadVideo(slot, vidId, originalUrl = null) {
-                if (!slot || !vidId) return;
+            _createIOSPlayButton(slot, vidId, originalUrl) {
+                const container = document.getElementById(`player-${slot}`)?.parentElement;
+                if (!container) return;
+
+                // Remove existing overlay if any
+                const existingOverlay = container.querySelector('.ios-play-overlay');
+                if (existingOverlay) existingOverlay.remove();
+
+                const overlay = document.createElement('div');
+                overlay.className = 'ios-play-overlay';
+                overlay.style.cssText = `
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0,0,0,0.8);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 1000;
+                cursor: pointer;
+                -webkit-tap-highlight-color: transparent;
+            `;
+
+                overlay.innerHTML = `
+                <div style="text-align: center; color: white; user-select: none;">
+                    <div style="font-size: 64px; margin-bottom: 15px;">▶️</div>
+                    <div style="font-size: 18px; font-weight: 500;">Tap to Play</div>
+                </div>
+            `;
+
+                const playHandler = () => {
+                    this._hasUserInteracted = true;
+                    overlay.remove();
+                    // Continue with actual loading
+                    this._loadVideoActual(slot, vidId, originalUrl);
+                };
+
+                overlay.addEventListener('click', playHandler);
+                overlay.addEventListener('touchend', (e) => {
+                    e.preventDefault();
+                    playHandler();
+                });
+
+                container.appendChild(overlay);
+            }
+
+            _loadVideoActual(slot, vidId, originalUrl) {
                 const isMain = slot === "main";
                 this._stopRealtimeLoop(slot);
 
@@ -3335,15 +3442,12 @@
                 const bc = document.getElementById(`badge-content-${slot}`);
                 if (bd) {
                     bd.style.display = "flex";
+                    bd.style.visibility = "visible";
                     void bd.offsetWidth;
                 }
                 if (bc) {
-                    const lastCount = this.lastKnownViewerCounts[slot];
-                    if (lastCount && this._isValidViewerCount(lastCount)) {
-                        bc.innerHTML = `${this.userIconSVG}<span>${this._escapeHtml(lastCount)}</span>`;
-                    } else {
-                        bc.innerHTML = `${this.userIconSVG}<span></span>`;
-                    }
+                    // Don't restore old counts - start fresh
+                    bc.innerHTML = `${this.userIconSVG}<span></span>`;
                 }
 
                 if (this.ytApiReady && window.YT && window.YT.Player) this.createYTPlayer(slot, vidId);
@@ -3375,6 +3479,18 @@
                 if (cb) cb.style.display = "flex";
 
                 this._startRealtimeLoop(slot);
+            }
+
+            loadVideo(slot, vidId, originalUrl = null) {
+                if (!slot || !vidId) return;
+
+                // iOS requires user interaction - add a play button overlay if needed
+                if (this._isIOS() && !this._hasUserInteracted) {
+                    this._createIOSPlayButton(slot, vidId, originalUrl);
+                    return;
+                }
+
+                this._loadVideoActual(slot, vidId, originalUrl);
             }
 
             async _handleStreamEnded(slot) {
@@ -3450,7 +3566,19 @@
             closeStream(slot, isManualClose = true) {
                 if (!slot) return;
 
+                // FIRST: Stop realtime loop and delete state immediately
                 this._stopRealtimeLoop(slot);
+
+                // Delete slot state IMMEDIATELY to prevent _protectAllBadges from restoring
+                if (this.slotStates[slot]) {
+                    delete this.slotStates[slot];
+                }
+
+                // Delete viewer counts IMMEDIATELY
+                delete this.lastKnownViewerCounts[slot];
+                delete this.previousViewerCounts[slot];
+                delete this.lastSuccessfulProxy[slot];
+                this._saveViewerCounts();
 
                 const isMain = slot === "main";
 
@@ -3482,18 +3610,25 @@
                     nd.id = `player-${slot}`;
                     nd.style.cssText = "display:none;position:absolute;top:0;left:0;width:100%;height:100%;";
                     ct.appendChild(nd);
+
+                    // Remove iOS overlay if exists
+                    const overlay = ct.querySelector('.ios-play-overlay');
+                    if (overlay) overlay.remove();
                 }
 
                 const ph = document.getElementById(`ph-${slot}`);
                 if (ph) ph.style.display = "flex";
 
+                // Clear badge completely
                 const bd = document.getElementById(`badge-${slot}`);
                 if (bd) {
                     bd.style.display = "none";
+                    bd.style.visibility = "hidden";
                 }
                 const bc = document.getElementById(`badge-content-${slot}`);
                 if (bc) {
                     bc.innerHTML = "";
+                    bc.textContent = "";
                 }
 
                 const cb = document.getElementById(`close-${slot}`);
@@ -3507,20 +3642,11 @@
                         cf.src = "";
                     }
                     if (cp) cp.style.display = "flex";
-                    delete this.previousViewerCounts["main"];
-                }
-
-                if (this.slotStates[slot]) {
-                    delete this.slotStates[slot];
                 }
 
                 if (this.currentUnmutedSlot === slot) {
                     this.currentUnmutedSlot = null;
                 }
-
-                delete this.lastKnownViewerCounts[slot];
-                delete this.lastSuccessfulProxy[slot];
-                this._saveViewerCounts();
 
                 if (this.channelConfigs[slot]) {
                     setTimeout(() => this.showDropdownWithoutAutoLoad(slot), 300);
